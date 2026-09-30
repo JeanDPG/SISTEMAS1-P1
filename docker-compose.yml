@@ -1,0 +1,22 @@
+services:
+  user-service:
+    build: ./user-service
+    container_name: p1-user-service
+    command: python user.py
+    ports:
+      - "5050:5050"
+    environment:
+      - SHARED_SECRET=12345678-1234-5678-1234-567812345678
+    restart: unless-stopped
+
+  file-service:
+    build: ./file-service
+    container_name: p1-file-service
+    command: python file.py
+    ports:
+      - "5051:5051"
+    environment:
+      - SHARED_SECRET=12345678-1234-5678-1234-567812345678
+    volumes:
+      - ./storage_data:/app/storage
+    restart: unless-stopped
