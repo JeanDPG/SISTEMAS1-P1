@@ -69,14 +69,14 @@ CREATE TABLE carrito_pelicula (
 
 CREATE TABLE pedidos (
     id_pedido SERIAL PRIMARY KEY,
-    id_usuario INT NOT NULL REFERENCES usuarios(id_usuario) ON DELETE RESTRICT,
+    id_usuario INT NOT NULL REFERENCES usuarios(id_usuario) ON DELETE CASCADE,
     fecha_pago TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     total_pagado DECIMAL(10, 2) NOT NULL DEFAULT 0.00 CHECK (total_pagado >= 0)
 );
 
 CREATE TABLE lineas_pedido (
     id_pedido INT REFERENCES pedidos(id_pedido) ON DELETE CASCADE,
-    id_pelicula INT REFERENCES peliculas(id_pelicula) ON DELETE RESTRICT,
+    id_pelicula INT REFERENCES peliculas(id_pelicula) ON DELETE CASCADE,
     cantidad INT NOT NULL CHECK (cantidad > 0),
     precio_unitario DECIMAL(8, 2) NOT NULL CHECK (precio_unitario >= 0),
     PRIMARY KEY (id_pedido, id_pelicula)

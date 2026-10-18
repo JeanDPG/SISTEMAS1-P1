@@ -4,6 +4,7 @@ import hashlib
 from quart import Quart, request
 from sqlalchemy import text
 from database import async_session
+from sqlalchemy.exc import IntegrityError
 
 app = Quart(__name__)
 
@@ -81,35 +82,41 @@ async def borrar_pelicula(id_pelicula):
 
 @app.get("/peliculas")
 async def listar_peliculas():
-    """Obtiene catálogo de películas filtrado por título o año (si se pasa por query params)."""
+    """Obtiene catálogo de películas filtrado por título o año."""
     titulo = request.args.get("titulo")
     anio_raw = request.args.get("anio")
 
-    # Parsear año a número entero si existe
-    anio = int(anio_raw) if anio_raw and anio_raw.isdigit() else None
-
-    # Casteo explícito ::TEXT y ::INT para resolver AmbiguousParameterError en PostgreSQL
-    query = text("""
+    sql_base = """
         SELECT p.id_pelicula, p.titulo, p.anio, p.precio, p.stock, d.nombre AS director
         FROM peliculas p
         LEFT JOIN directores d ON p.id_director = d.id_director
-        WHERE (:titulo::TEXT IS NULL OR p.titulo ILIKE '%' || :titulo::TEXT || '%')
-          AND (:anio::INT IS NULL OR p.anio = :anio::INT);
-    """)
+    """
+    
+    condiciones = []
+    params = {}
+
+    if titulo and titulo.strip():
+        condiciones.append("p.titulo ILIKE '%' || :titulo || '%'")
+        params["titulo"] = titulo.strip()
+
+    if anio_raw and anio_raw.isdigit():
+        condiciones.append("p.anio = :anio")
+        params["anio"] = int(anio_raw)
+
+    if condiciones:
+        sql_base += " WHERE " + " AND ".join(condiciones)
+
+    query = text(sql_base)
 
     async with async_session() as session:
-        res = await session.execute(query, {
-            "titulo": titulo if titulo else None, 
-            "anio": anio
-        })
+        res = await session.execute(query, params)
         peliculas = [dict(row._mapping) for row in res.fetchall()]
         
-        # Convertir tipos Decimal a float para permitir serialización a JSON
         for p in peliculas:
             if "precio" in p and p["precio"] is not None:
                 p["precio"] = float(p["precio"])
 
-        return jsonify(peliculas), 200
+        return peliculas, 200
 
 
 # =========================================================
@@ -164,69 +171,82 @@ async def anadir_al_carrito():
             return {"mensaje": "Película añadida al carrito", "detalle": dict(item._mapping)}, 200
 
 
+from sqlalchemy.exc import DBAPIError, IntegrityError
+
 @app.post("/carrito/pagar")
 async def pagar_carrito():
-    """
-    b. Pagar el carrito de la compra.
-    c. Almacenar la fecha de pago y calcular total.
-    (El trigger del pedido descontará automáticamente el saldo al usuario).
-    """
-    try:
-        data = await request.get_json()
-    except Exception:
-        return {"error": "JSON mal formado"}, 400
-
-    id_usuario = data.get("id_usuario")
-    if not id_usuario:
-        return {"error": "Falta id_usuario"}, 400
-
-    # Una sola consulta realiza: cálculo del total del carrito, inserción del pedido, 
-    # vuelco de líneas de pedido y cierre del carrito.
-    query = text("""
-        WITH carrito_activo AS (
-            SELECT id_carrito FROM carritos 
-            WHERE id_usuario = :id_usuario AND estado = 'activo'
-            LIMIT 1
-        ),
-        items_precio AS (
-            SELECT cp.id_pelicula, cp.cantidad, p.precio, (cp.cantidad * p.precio) AS subtotal
-            FROM carrito_pelicula cp
-            JOIN peliculas p ON cp.id_pelicula = p.id_pelicula
-            WHERE cp.id_carrito = (SELECT id_carrito FROM carrito_activo)
-        ),
-        nuevo_pedido AS (
-            INSERT INTO pedidos (id_usuario, fecha_pago, total_pagado)
-            SELECT :id_usuario, CURRENT_TIMESTAMP, COALESCE(SUM(subtotal), 0)
-            FROM items_precio
-            RETURNING id_pedido, fecha_pago, total_pagado
-        ),
-        ins_lineas AS (
-            INSERT INTO lineas_pedido (id_pedido, id_pelicula, cantidad, precio_unitario)
-            SELECT np.id_pedido, ip.id_pelicula, ip.cantidad, ip.precio
-            FROM nuevo_pedido np CROSS JOIN items_precio ip
-        ),
-        cierra_carrito AS (
-            UPDATE carritos SET estado = 'completado'
-            WHERE id_carrito = (SELECT id_carrito FROM carrito_activo)
-        )
-        SELECT id_pedido, fecha_pago, total_pagado FROM nuevo_pedido;
-    """)
+    data = await request.get_json() or {}
+    id_usuario = data.get("id_usuario") 
 
     async with async_session() as session:
-        async with session.begin():
-            try:
-                res = await session.execute(query, {"id_usuario": id_usuario})
-                pedido = res.fetchone()
-                if not pedido:
-                    return {"error": "No hay un carrito activo para procesar el pago"}, 400
-                return {
-                    "mensaje": "Pago completado correctamente",
-                    "pedido": dict(pedido._mapping)
-                }, 200
-            except Exception as e:
-                # Captura la excepción enviada por el trigger de falta de saldo
-                return {"error": str(e)}, 400
+        # 1. Obtener carrito activo
+        res_carrito = await session.execute(
+            text("SELECT id_carrito FROM carritos WHERE id_usuario = :uid AND estado = 'activo'"),
+            {"uid": id_usuario}
+        )
+        carrito = res_carrito.fetchone()
 
+        if not carrito:
+            return {"error": "No hay un carrito activo para este usuario"}, 400
+
+        id_carrito = carrito.id_carrito
+
+        # 2. Calcular total a pagar
+        res_total = await session.execute(
+            text("""
+                SELECT COALESCE(SUM(cp.cantidad * p.precio), 0.00) AS total
+                FROM carrito_pelicula cp
+                JOIN peliculas p ON cp.id_pelicula = p.id_pelicula
+                WHERE cp.id_carrito = :cid
+            """),
+            {"cid": id_carrito}
+        )
+        total_carrito = res_total.scalar()
+
+        if total_carrito <= 0:
+            return {"error": "El carrito está vacío"}, 400
+
+        try:
+            # 3. Intentar insertar el pedido (se dispara el TRIGGER tf_procesar_pago_pedido)
+            query_pedido = text("""
+                INSERT INTO pedidos (id_usuario, total_pagado) 
+                VALUES (:uid, :total) 
+                RETURNING id_pedido, fecha_pago
+            """)
+            res_pedido = await session.execute(query_pedido, {"uid": id_usuario, "total": total_carrito})
+            nuevo_pedido = res_pedido.fetchone()
+
+            # 4. Actualizar estado del carrito
+            await session.execute(
+                text("UPDATE carritos SET estado = 'completado' WHERE id_carrito = :cid"),
+                {"cid": id_carrito}
+            )
+
+            await session.commit()
+
+            return {
+                "mensaje": "Pago completado correctamente",
+                "pedido": {
+                    "id_pedido": nuevo_pedido.id_pedido,
+                    "fecha_pago": str(nuevo_pedido.fecha_pago),
+                    "total_pagado": str(total_carrito)
+                }
+            }, 200
+
+        except (IntegrityError, DBAPIError) as e:
+            # Revertir los cambios en la transacción
+            await session.rollback()
+            
+            # Comprobar si el fallo proviene del TRIGGER de saldo insuficiente
+            mensaje_error = str(e)
+            if "Saldo insuficiente" in mensaje_error:
+                return {"error": "Saldo insuficiente para realizar la compra"}, 400
+            
+            return {"error": "Error de integridad en la base de datos", "detalle": mensaje_error}, 400
+
+        except Exception as e:
+            await session.rollback()
+            return {"error": f"Error inesperado: {str(e)}"}, 500
 
 # =========================================================
 # 4. CONSULTAS AVANZADAS
