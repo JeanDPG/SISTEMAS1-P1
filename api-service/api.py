@@ -314,10 +314,11 @@ async def recuperar_ventas(anio, pais):
             u.id_usuario,
             u.nombre AS usuario_nombre,
             u.pais
-        FROM pedidos p
-        JOIN usuarios u ON p.id_usuario = u.id_usuario
-        WHERE u.pais = :pais 
-          AND EXTRACT(YEAR FROM p.fecha_pago) = :anio;
+        FROM usuarios u
+        JOIN pedidos p ON p.id_usuario = u.id_usuario
+        WHERE u.pais = :pais
+          AND p.fecha_pago >= make_date(:anio, 1, 1)
+          AND p.fecha_pago < make_date(:anio + 1, 1, 1);
     """)
 
     async with async_session() as session:
