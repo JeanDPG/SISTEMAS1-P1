@@ -1,47 +1,104 @@
 version: '3.8'
 
 services:
-  postgres-db:
-    image: postgres:15-alpine
-    container_name: postgres_si1
+  # ============================================================================
+  # API GATEWAY (Nginx)
+  # Único punto de entrada expuesto al exterior (puerto 8080).
+  # ============================================================================
+  api-gateway:
+    image: nginx:alpine
+    container_name: api-gateway
     restart: unless-stopped
-    environment:
-      POSTGRES_DB: si1
-      POSTGRES_USER: alumnodb
-      POSTGRES_PASSWORD: 1234
     ports:
-      - "9999:5432"
+      - "8080:8080"
     volumes:
-      - ./db/01-schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
-      - ./db/02-populate.sql:/docker-entrypoint-initdb.d/02-populate.sql
-      - postgres_data:/var/lib/postgresql/data
+      - ./api-gateway/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - auth-service
+      - library-service
+    networks:
+      - internal-net
 
-  user-service:
-    build: ./user-service
-    container_name: p1-user-service
-    ports:
-      - "5050:5050"
-    env_file:
-      - .env
+  # ============================================================================
+  # MICROSERVICIO DE AUTENTICACIÓN (auth-service)
+  # Puerto interno: 5050 (no accesible directamente desde el exterior)
+  # ============================================================================
+  auth-service:
+    build:
+      context: ./auth-service
+      dockerfile: Dockerfile
+    container_name: auth-service
+    restart: unless-stopped
+    expose:
+      - "5050"
     environment:
-      DATABASE_URL: "postgresql+asyncpg://alumnodb:1234@postgres-db:5432/si1"
+      - PORT=5050
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    depends_on:
+      - redis
+    networks:
+      - internal-net
+
+  # ============================================================================
+  # BASE DE DATOS REDIS (NoSQL con persistencia AOF)
+  # ============================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: redis-db
+    restart: unless-stopped
+    # Persistencia AOF obligatoria según el enunciado
+    command: redis-server --appendonly yes
+    expose:
+      - "6379"
     volumes:
-      - ./user-service/data:/app/data
-    depends_on:
-      - postgres-db
-    restart: unless-stopped
+      - redis_data:/data
+    networks:
+      - internal-net
 
-  api-service:
-    build: ./api-service
-    container_name: p2-api-service
-    ports:
-      - "5000:5000"
-    environment:
-      DATABASE_URL: "postgresql+asyncpg://alumnodb:1234@postgres-db:5432/si1"
-    depends_on:
-      - postgres-db
+  # ============================================================================
+  # MICROSERVICIO DE BIBLIOTECA (library-service)
+  # Puerto interno: 5051 (no accesible directamente desde el exterior)
+  # ============================================================================
+  library-service:
+    build:
+      context: ./library-service
+      dockerfile: Dockerfile
+    container_name: library-service
     restart: unless-stopped
+    expose:
+      - "5051"
+    environment:
+      - PORT=5051
+      - MONGO_URI=mongodb://mongodb:27017/library_db
+    depends_on:
+      - mongodb
+    networks:
+      - internal-net
+
+  # ============================================================================
+  # BASE DE DATOS MONGODB (NoSQL para biblioteca)
+  # ============================================================================
+  mongodb:
+    image: mongo:6
+    container_name: mongodb
+    restart: unless-stopped
+    expose:
+      - "27017"
+    volumes:
+      - mongo_data:/data/db
+    networks:
+      - internal-net
+
+# ==============================================================================
+# RED Y VOLÚMENES PERSISTENTES
+# ==============================================================================
+networks:
+  internal-net:
+    driver: bridge
 
 volumes:
-  postgres_data:
+  redis_data:
+    driver: local
+  mongo_data:
     driver: local

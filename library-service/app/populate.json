@@ -1,0 +1,29 @@
+[
+  {
+    "isbn": "978-0132350884",
+    "title": "Clean Code",
+    "author": "Robert C. Martin",
+    "year": 2008,
+    "publisher": "Prentice Hall",
+    "available_stock": 5,
+    "loan_history": []
+  },
+  {
+    "isbn": "978-0201633610",
+    "title": "Design Patterns",
+    "author": "Erich Gamma, Richard Helm, Ralph Johnson, John Vlissides",
+    "year": 1994,
+    "publisher": "Addison-Wesley",
+    "available_stock": 3,
+    "loan_history": []
+  },
+  {
+    "isbn": "978-0131103627",
+    "title": "The C Programming Language",
+    "author": "Brian W. Kernighan, Dennis M. Ritchie",
+    "year": 1988,
+    "publisher": "Prentice Hall",
+    "available_stock": 0,
+    "loan_history": []
+  }
+]
