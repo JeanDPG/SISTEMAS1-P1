@@ -1,24 +1,64 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from quart import Blueprint, request, jsonify
+from pymongo import ReturnDocument
 from app.mongodb_client import get_db
 
 library_bp = Blueprint("library", __name__)
 
+
+def serialize_mongo_doc(doc: dict | None) -> dict | None:
+    """Serializa ObjectIds y datetimes para que sean JSON-serializables."""
+    if not doc or not isinstance(doc, dict):
+        return doc
+    clean = {}
+    for k, v in doc.items():
+        if k == "_id":
+            clean["_id"] = str(v)
+        elif isinstance(v, datetime):
+            clean[k] = v.isoformat()
+        elif isinstance(v, list):
+            clean_list = []
+            for item in v:
+                if isinstance(item, dict):
+                    clean_list.append(serialize_mongo_doc(item))
+                elif isinstance(item, datetime):
+                    clean_list.append(item.isoformat())
+                else:
+                    clean_list.append(item)
+            clean[k] = clean_list
+        elif isinstance(v, dict):
+            clean[k] = serialize_mongo_doc(v)
+        else:
+            clean[k] = v
+    return clean
+
+
 @library_bp.before_request
 async def verify_auth_header():
     """
-    Nginx inyecta la cabecera 'X-User-Id' tras validar el token con auth-service.
-    Este servicio confía únicamente en ese encabezado.
+    Nginx realiza la autenticación previa e inyecta la cabecera 'X-User-Id'.
+    Este microservicio confía únicamente en esa cabecera.
     """
     user_id = request.headers.get("X-User-Id")
     if not user_id:
-        # En caso de acceso no autorizado
-        return jsonify({"error": "No autorizado: falta cabecera X-User-Id"}), 401
+        return jsonify({"error": "No autorizado: falta cabecera de identidad X-User-Id"}), 401
 
 
 # ==============================================================================
 # ENDPOINTS DE GESTIÓN DE LIBROS
 # ==============================================================================
+
+@library_bp.get("/books")
+async def list_books():
+    """
+    GET /library/books
+    Lista todos los libros existentes en la colección 'books'.
+    """
+    db = get_db()
+    cursor = db.books.find({})
+    books = await cursor.to_list(length=None)
+    return jsonify([serialize_mongo_doc(b) for b in books]), 200
+
 
 @library_bp.post("/books")
 async def create_book():
@@ -27,7 +67,10 @@ async def create_book():
     Crea un nuevo libro en la colección 'books'.
     El campo 'loan_history' se inicializa como array vacío ([]).
     """
-    data = await request.get_json() or {}
+    data = await request.get_json()
+    if not data:
+        return jsonify({"error": "Payload JSON requerido"}), 400
+
     isbn = data.get("isbn")
     title = data.get("title")
     author = data.get("author")
@@ -35,12 +78,38 @@ async def create_book():
     publisher = data.get("publisher")
     available_stock = data.get("available_stock", 0)
 
+    if not isbn or not title or not author:
+        return jsonify({"error": "Faltan campos obligatorios: isbn, title, author"}), 400
+
+    try:
+        available_stock = int(available_stock)
+        if available_stock < 0:
+            return jsonify({"error": "El stock disponible no puede ser negativo"}), 400
+    except (ValueError, TypeError):
+        return jsonify({"error": "available_stock debe ser un número entero"}), 400
+
     db = get_db()
 
-    # TODO: 1. Validar que vengan los campos obligatorios
-    # TODO: 2. Comprobar que no exista ya un libro con el mismo ISBN
-    # TODO: 3. Insertar el libro con 'loan_history': []
-    return jsonify({"message": "Libro creado correctamente", "isbn": isbn}), 201
+    # Comprobar si ya existe un libro con ese ISBN
+    existing = await db.books.find_one({"isbn": str(isbn)})
+    if existing:
+        return jsonify({"error": f"Ya existe un libro con el ISBN '{isbn}'"}), 409
+
+    new_book = {
+        "isbn": str(isbn),
+        "title": str(title),
+        "author": str(author),
+        "year": int(year) if year is not None else None,
+        "publisher": str(publisher) if publisher is not None else "",
+        "available_stock": available_stock,
+        "loan_history": []
+    }
+
+    await db.books.insert_one(new_book)
+    return jsonify({
+        "message": "Libro creado correctamente",
+        "book": serialize_mongo_doc(new_book)
+    }), 201
 
 
 @library_bp.delete("/books/<isbn>")
@@ -48,42 +117,52 @@ async def delete_book(isbn: str):
     """
     DELETE /library/books/<isbn>
     Borra un libro existente.
-    IMPORTANTE: Se debe controlar el caso de borrar un libro que tiene préstamos
-    activos (return_date es null/None), no permitiendo borrarlo hasta su devolución.
+    Controla el caso de borrar un libro que tiene préstamos activos
+    (return_date == None), rechazando el borrado hasta su devolución.
     """
     db = get_db()
+    book = await db.books.find_one({"isbn": str(isbn)})
+    if not book:
+        return jsonify({"error": f"No se encontró el libro con ISBN '{isbn}'"}), 404
 
-    # TODO: 1. Buscar el libro por 'isbn'
-    # TODO: 2. Verificar si tiene algún préstamo activo en 'loan_history' (return_date is None)
-    #          Si tiene préstamos activos -> rechazar borrado (e.g., 400 Bad Request o 409 Conflict)
-    # TODO: 3. Si no tiene préstamos activos, borrar el documento de la colección 'books'
-    return jsonify({"message": f"Libro {isbn} eliminado correctamente"}), 200
+    # Verificar si hay préstamos activos
+    active_loans = [
+        loan for loan in book.get("loan_history", [])
+        if loan.get("return_date") is None
+    ]
+    if active_loans:
+        return jsonify({
+            "error": "No se puede borrar el libro porque tiene préstamos activos pendientes de devolución"
+        }), 409
+
+    await db.books.delete_one({"isbn": str(isbn)})
+    return jsonify({"message": f"Libro con ISBN '{isbn}' eliminado correctamente"}), 200
 
 
 @library_bp.get("/books/<isbn>")
 async def get_book(isbn: str):
     """
     GET /library/books/<isbn>
-    Obtiene información de un libro, así como la lista completa de préstamos (loan_history).
+    Obtiene información de un libro, así como la lista completa de préstamos.
     """
     db = get_db()
+    book = await db.books.find_one({"isbn": str(isbn)})
+    if not book:
+        return jsonify({"error": f"No se encontró el libro con ISBN '{isbn}'"}), 404
 
-    # TODO: 1. Buscar el libro por 'isbn' en la colección 'books'
-    # TODO: 2. Si no existe, devolver 404
-    # TODO: 3. Devolver los datos del libro (sin el '_id' de Mongo o serializado a string)
-    return jsonify({"isbn": isbn, "loan_history": []}), 200
+    return jsonify(serialize_mongo_doc(book)), 200
 
 
 @library_bp.get("/books/out-of-stock")
 async def get_out_of_stock_books():
     """
     GET /library/books/out-of-stock
-    Lista todos los libros que tengan available_stock igual a 0.
+    Lista todos los libros que tengan stock igual a 0.
     """
     db = get_db()
-
-    # TODO: Consultar libros con filtro {'available_stock': 0}
-    return jsonify([]), 200
+    cursor = db.books.find({"available_stock": 0})
+    books = await cursor.to_list(length=None)
+    return jsonify([serialize_mongo_doc(b) for b in books]), 200
 
 
 # ==============================================================================
@@ -94,16 +173,21 @@ async def get_out_of_stock_books():
 async def get_active_loans():
     """
     GET /library/loans/active
-    Lista los libros que actualmente están prestados al usuario autenticado (X-User-Id)
-    (es decir, en su 'loan_history' existe un sub-documento con user_id == X-User-Id
-    y return_date == None).
+    Lista los libros que están actualmente prestados al usuario autenticado (X-User-Id).
     """
     user_id = request.headers.get("X-User-Id")
     db = get_db()
 
-    # TODO: Buscar libros donde loan_history contenga un elemento con:
-    #       {'user_id': user_id, 'return_date': None}
-    return jsonify([]), 200
+    cursor = db.books.find({
+        "loan_history": {
+            "$elemMatch": {
+                "user_id": user_id,
+                "return_date": None
+            }
+        }
+    })
+    books = await cursor.to_list(length=None)
+    return jsonify([serialize_mongo_doc(b) for b in books]), 200
 
 
 @library_bp.get("/loans/history")
@@ -111,12 +195,27 @@ async def get_loan_history():
     """
     GET /library/loans/history
     Lista el histórico completo de préstamos del usuario autenticado (X-User-Id).
+    Garantiza que no se puede acceder al historial de otro usuario.
     """
     user_id = request.headers.get("X-User-Id")
     db = get_db()
 
-    # TODO: Buscar todos los libros donde loan_history contenga {'user_id': user_id}
-    return jsonify([]), 200
+    cursor = db.books.find({"loan_history.user_id": user_id})
+    books = await cursor.to_list(length=None)
+
+    history = []
+    for book in books:
+        for loan in book.get("loan_history", []):
+            if loan.get("user_id") == user_id:
+                history.append({
+                    "isbn": book.get("isbn"),
+                    "title": book.get("title"),
+                    "author": book.get("author"),
+                    "loan_date": loan.get("loan_date"),
+                    "return_date": loan.get("return_date")
+                })
+
+    return jsonify(history), 200
 
 
 @library_bp.post("/books/<isbn>/borrow")
@@ -125,28 +224,43 @@ async def borrow_book(isbn: str):
     POST /library/books/<isbn>/borrow
     Toma en préstamo un libro por parte del usuario autenticado (X-User-Id).
     
-    OPERACIÓN ATÓMICA REQUERIDA (Evitar condiciones de carrera):
-    Usar find_one_and_update() con filtro atómico:
-      - Filtro: {'isbn': isbn, 'available_stock': {'$gt': 0}}
-      - Update:
-          {
-            '$inc': {'available_stock': -1},
-            '$push': {
-              'loan_history': {
-                'user_id': user_id,
-                'loan_date': datetime.utcnow(),
-                'return_date': None
-              }
-            }
-          }
+    OPERACIÓN ATÓMICA DE MONGODB (Evita condiciones de carrera en stock):
+    Utiliza find_one_and_update() con filtro atómico 'available_stock > 0'.
     """
     user_id = request.headers.get("X-User-Id")
     db = get_db()
 
-    # TODO: 1. Ejecutar find_one_and_update atómico
-    # TODO: 2. Si el resultado es None, determinar si el libro no existe (404) o no hay stock (400)
-    # TODO: 3. Retornar confirmación del préstamo (200)
-    return jsonify({"message": f"Préstamo realizado para {user_id}", "isbn": isbn}), 200
+    now_iso = datetime.now(timezone.utc).isoformat()
+    new_loan = {
+        "user_id": user_id,
+        "loan_date": now_iso,
+        "return_date": None
+    }
+
+    # Operación atómica de MongoDB
+    updated_book = await db.books.find_one_and_update(
+        {
+            "isbn": str(isbn),
+            "available_stock": {"$gt": 0}
+        },
+        {
+            "$inc": {"available_stock": -1},
+            "$push": {"loan_history": new_loan}
+        },
+        return_document=ReturnDocument.AFTER
+    )
+
+    if not updated_book:
+        # Verificar si no existía el libro o no quedaba stock disponible
+        exists = await db.books.find_one({"isbn": str(isbn)})
+        if not exists:
+            return jsonify({"error": f"No se encontró el libro con ISBN '{isbn}'"}), 404
+        return jsonify({"error": f"No hay stock disponible para el libro con ISBN '{isbn}'"}), 400
+
+    return jsonify({
+        "message": f"Préstamo realizado con éxito para el usuario '{user_id}'",
+        "book": serialize_mongo_doc(updated_book)
+    }), 200
 
 
 @library_bp.post("/books/<isbn>/return")
@@ -155,17 +269,43 @@ async def return_book(isbn: str):
     POST /library/books/<isbn>/return
     Devuelve un libro que estaba prestado al usuario autenticado (X-User-Id).
     
-    OPERACIÓN ATÓMICA REQUERIDA:
-    Actualiza el subdocumento en 'loan_history' donde:
-      user_id == user_id AND return_date == None
-    poniendo 'return_date' a datetime.utcnow(), e incrementa 'available_stock' en +1.
+    OPERACIÓN ATÓMICA DE MONGODB:
+    Actualiza el préstamo activo en loan_history fijando return_date e incrementa available_stock.
     """
     user_id = request.headers.get("X-User-Id")
     db = get_db()
 
-    # TODO: 1. Ejecutar find_one_and_update con filtro atómico:
-    #          Filtro: {'isbn': isbn, 'loan_history': {'$elemMatch': {'user_id': user_id, 'return_date': None}}}
-    #          Update: {'$inc': {'available_stock': 1}, '$set': {'loan_history.$.return_date': datetime.utcnow()}}
-    # TODO: 2. Si no coincide ninguna entrada (no tenía préstamo activo de ese libro), devolver error (400 o 404)
-    # TODO: 3. Retornar confirmación de devolución (200)
-    return jsonify({"message": f"Libro {isbn} devuelto por {user_id}"}), 200
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    # Operación atómica: busca el libro que tenga un préstamo activo de este usuario
+    updated_book = await db.books.find_one_and_update(
+        {
+            "isbn": str(isbn),
+            "loan_history": {
+                "$elemMatch": {
+                    "user_id": user_id,
+                    "return_date": None
+                }
+            }
+        },
+        {
+            "$inc": {"available_stock": 1},
+            "$set": {
+                "loan_history.$.return_date": now_iso
+            }
+        },
+        return_document=ReturnDocument.AFTER
+    )
+
+    if not updated_book:
+        exists = await db.books.find_one({"isbn": str(isbn)})
+        if not exists:
+            return jsonify({"error": f"No se encontró el libro con ISBN '{isbn}'"}), 404
+        return jsonify({
+            "error": f"El usuario '{user_id}' no tiene ningún préstamo activo del libro '{isbn}'"
+        }), 400
+
+    return jsonify({
+        "message": f"Libro con ISBN '{isbn}' devuelto correctamente",
+        "book": serialize_mongo_doc(updated_book)
+    }), 200

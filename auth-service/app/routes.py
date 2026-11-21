@@ -6,10 +6,10 @@ from app.redis_client import get_redis
 auth_bp = Blueprint("auth", __name__)
 
 # ==============================================================================
-# UTILIDADES AUXILIARES (Estructura base)
+# UTILIDADES AUXILIARES
 # ==============================================================================
 def hash_password(password: str) -> str:
-    """Calcula el hash de la contraseña (e.g. SHA-256)."""
+    """Calcula el hash SHA-256 de la contraseña."""
     return hashlib.sha256(password.encode("utf-8")).hexdigest()
 
 def extract_bearer_token() -> str | None:
@@ -17,7 +17,8 @@ def extract_bearer_token() -> str | None:
     auth_header = request.headers.get("Authorization", "")
     if not auth_header.startswith("Bearer "):
         return None
-    return auth_header[len("Bearer "):].strip()
+    token = auth_header[len("Bearer "):].strip()
+    return token if token else None
 
 
 # ==============================================================================
@@ -32,7 +33,7 @@ async def register():
     Modelo en Redis:
       Clave: user:{username} (HASH)
       Campos: password_hash, email
-      Sin TTL (persistente por directiva AOF).
+      Sin TTL (persistente en disco mediante directiva AOF).
     """
     data = await request.get_json()
     if not data:
@@ -43,15 +44,27 @@ async def register():
     email = data.get("email")
 
     if not username or not password or not email:
-        return jsonify({"error": "Faltan campos obligatorios"}), 400
+        return jsonify({"error": "Faltan campos obligatorios: username, password, email"}), 400
 
     redis = await get_redis()
 
-    # TODO: 1. Comprobar si el usuario ya existe en Redis (user:{username})
-    # TODO: 2. Hashear la contraseña (usando hash_password)
-    # TODO: 3. Guardar en Redis como HASH bajo 'user:{username}' los campos password_hash y email (sin TTL)
+    # 1. Comprobar si el usuario ya existe en Redis
+    user_key = f"user:{username}"
+    if await redis.exists(user_key):
+        return jsonify({"error": f"El usuario '{username}' ya existe"}), 409
 
-    return jsonify({"message": "Usuario registrado exitosamente"}), 201
+    # 2. Hashear la contraseña y almacenar el perfil permanente en Redis (HASH sin TTL)
+    pwd_hash = hash_password(password)
+    await redis.hset(user_key, mapping={
+        "username": username,
+        "password_hash": pwd_hash,
+        "email": email
+    })
+
+    return jsonify({
+        "message": "Usuario registrado exitosamente",
+        "username": username
+    }), 201
 
 
 @auth_bp.post("/login")
@@ -61,7 +74,8 @@ async def login():
     Inicia la sesión de un usuario registrado (username, password).
     Devuelve su token correspondiente.
     Modelo en Redis:
-      Clave: session:{token} (STRING o HASH vinculando al usuario)
+      Clave: session:{token}
+      Valor: username
       TTL: 5 minutos (300 segundos).
     """
     data = await request.get_json()
@@ -72,16 +86,28 @@ async def login():
     password = data.get("password")
 
     if not username or not password:
-        return jsonify({"error": "Credenciales incompletas"}), 400
+        return jsonify({"error": "Credenciales incompletas: se requieren username y password"}), 400
 
     redis = await get_redis()
 
-    # TODO: 1. Verificar si existe user:{username} en Redis y comprobar su password_hash
-    # TODO: 2. Generar un nuevo token de sesión único (e.g. uuid.uuid4().hex)
-    # TODO: 3. Guardar en Redis 'session:{token}' apuntando al username/user_id con TTL de 5 minutos (300s)
+    # 1. Verificar si existe user:{username} y validar contraseña
+    user_key = f"user:{username}"
+    stored_hash = await redis.hget(user_key, "password_hash")
+    if not stored_hash or stored_hash != hash_password(password):
+        return jsonify({"error": "Credenciales inválidas"}), 401
 
+    # 2. Generar un nuevo token de sesión único (UUID)
     session_token = str(uuid.uuid4())
-    return jsonify({"token": session_token}), 200
+
+    # 3. Guardar en Redis con TTL de 5 minutos (300 segundos)
+    session_key = f"session:{session_token}"
+    await redis.set(session_key, username, ex=300)
+
+    return jsonify({
+        "message": "Login exitoso",
+        "token": session_token,
+        "username": username
+    }), 200
 
 
 @auth_bp.get("/validate")
@@ -100,14 +126,17 @@ async def validate():
 
     redis = await get_redis()
 
-    # TODO: 1. Buscar la clave 'session:{token}' en Redis
-    # TODO: 2. Si no existe (o expiró por TTL), retornar ("", 401)
-    # TODO: 3. Si existe, obtener el username/user_id asociado y retornar:
-    #          response = await make_response("", 200)
-    #          response.headers["X-User-Id"] = username
-    #          return response
+    # 1. Buscar la sesión en Redis
+    session_key = f"session:{token}"
+    username = await redis.get(session_key)
 
-    return ("", 401)
+    if not username:
+        return jsonify({"error": "Token desconocido, caducado o no autorizado"}), 401
+
+    # 2. Devolver 200 OK con la cabecera X-User-Id requerida por Nginx
+    response = await make_response(jsonify({"valid": True, "username": username}), 200)
+    response.headers["X-User-Id"] = username
+    return response
 
 
 @auth_bp.post("/logout")
@@ -126,8 +155,13 @@ async def logout():
 
     redis = await get_redis()
 
-    # TODO: 1. Verificar si 'session:{token}' existe en Redis
-    # TODO: 2. Si no existe, retornar ("", 401)
-    # TODO: 3. Si existe, eliminar la clave de Redis inmediatamente (retornar 200)
+    # 1. Comprobar si la sesión existe
+    session_key = f"session:{token}"
+    exists = await redis.exists(session_key)
+    if not exists:
+        return jsonify({"error": "Sesión desconocida, expirada o previamente cerrada"}), 401
 
-    return jsonify({"message": "Sesión cerrada exitosamente"}), 200
+    # 2. Eliminar la sesión inmediatamente de Redis
+    await redis.delete(session_key)
+
+    return jsonify({"message": "Sesión cerrada e invalidada exitosamente"}), 200
