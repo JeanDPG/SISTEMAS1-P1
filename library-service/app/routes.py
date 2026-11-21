@@ -67,9 +67,9 @@ async def create_book():
     Crea un nuevo libro en la colección 'books'.
     El campo 'loan_history' se inicializa como array vacío ([]).
     """
-    data = await request.get_json()
-    if not data:
-        return jsonify({"error": "Payload JSON requerido"}), 400
+    data = await request.get_json(silent=True)
+    if not data or not isinstance(data, dict):
+        return jsonify({"error": "Payload JSON requerido o malformado"}), 400
 
     isbn = data.get("isbn")
     title = data.get("title")
@@ -78,8 +78,23 @@ async def create_book():
     publisher = data.get("publisher")
     available_stock = data.get("available_stock", 0)
 
-    if not isbn or not title or not author:
-        return jsonify({"error": "Faltan campos obligatorios: isbn, title, author"}), 400
+    # Validación rigurosa de campos obligatorios (evita cadenas vacías o tipos erróneos)
+    if (
+        not isbn or not isinstance(isbn, (str, int)) or not str(isbn).strip() or
+        not title or not isinstance(title, str) or not title.strip() or
+        not author or not isinstance(author, str) or not author.strip()
+    ):
+        return jsonify({"error": "Faltan campos obligatorios: isbn, title y author (deben ser no vacíos)"}), 400
+
+    isbn = str(isbn).strip()
+    title = title.strip()
+    author = author.strip()
+
+    if year is not None:
+        try:
+            year = int(year)
+        except (ValueError, TypeError):
+            return jsonify({"error": "El campo 'year' debe ser un número entero"}), 400
 
     try:
         available_stock = int(available_stock)
@@ -91,16 +106,16 @@ async def create_book():
     db = get_db()
 
     # Comprobar si ya existe un libro con ese ISBN
-    existing = await db.books.find_one({"isbn": str(isbn)})
+    existing = await db.books.find_one({"isbn": isbn})
     if existing:
         return jsonify({"error": f"Ya existe un libro con el ISBN '{isbn}'"}), 409
 
     new_book = {
-        "isbn": str(isbn),
-        "title": str(title),
-        "author": str(author),
-        "year": int(year) if year is not None else None,
-        "publisher": str(publisher) if publisher is not None else "",
+        "isbn": isbn,
+        "title": title,
+        "author": author,
+        "year": year,
+        "publisher": str(publisher).strip() if publisher is not None else "",
         "available_stock": available_stock,
         "loan_history": []
     }
@@ -139,6 +154,18 @@ async def delete_book(isbn: str):
     return jsonify({"message": f"Libro con ISBN '{isbn}' eliminado correctamente"}), 200
 
 
+@library_bp.get("/books/out-of-stock")
+async def get_out_of_stock_books():
+    """
+    GET /library/books/out-of-stock
+    Lista todos los libros que tengan stock igual a 0.
+    """
+    db = get_db()
+    cursor = db.books.find({"available_stock": 0})
+    books = await cursor.to_list(length=None)
+    return jsonify([serialize_mongo_doc(b) for b in books]), 200
+
+
 @library_bp.get("/books/<isbn>")
 async def get_book(isbn: str):
     """
@@ -151,18 +178,6 @@ async def get_book(isbn: str):
         return jsonify({"error": f"No se encontró el libro con ISBN '{isbn}'"}), 404
 
     return jsonify(serialize_mongo_doc(book)), 200
-
-
-@library_bp.get("/books/out-of-stock")
-async def get_out_of_stock_books():
-    """
-    GET /library/books/out-of-stock
-    Lista todos los libros que tengan stock igual a 0.
-    """
-    db = get_db()
-    cursor = db.books.find({"available_stock": 0})
-    books = await cursor.to_list(length=None)
-    return jsonify([serialize_mongo_doc(b) for b in books]), 200
 
 
 # ==============================================================================
@@ -207,12 +222,18 @@ async def get_loan_history():
     for book in books:
         for loan in book.get("loan_history", []):
             if loan.get("user_id") == user_id:
+                loan_date = loan.get("loan_date")
+                if isinstance(loan_date, datetime):
+                    loan_date = loan_date.isoformat()
+                return_date = loan.get("return_date")
+                if isinstance(return_date, datetime):
+                    return_date = return_date.isoformat()
                 history.append({
                     "isbn": book.get("isbn"),
                     "title": book.get("title"),
                     "author": book.get("author"),
-                    "loan_date": loan.get("loan_date"),
-                    "return_date": loan.get("return_date")
+                    "loan_date": loan_date,
+                    "return_date": return_date
                 })
 
     return jsonify(history), 200

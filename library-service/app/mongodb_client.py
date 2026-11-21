@@ -27,3 +27,11 @@ def get_db():
         except Exception:
             _mongo_db = client["library_db"]
     return _mongo_db
+
+async def close_client():
+    """Cierra la conexión con MongoDB."""
+    global _mongo_client, _mongo_db
+    if _mongo_client is not None:
+        await _mongo_client.close()
+        _mongo_client = None
+        _mongo_db = None

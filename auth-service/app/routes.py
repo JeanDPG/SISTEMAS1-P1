@@ -15,10 +15,10 @@ def hash_password(password: str) -> str:
 def extract_bearer_token() -> str | None:
     """Extrae el token Bearer del encabezado Authorization."""
     auth_header = request.headers.get("Authorization", "")
-    if not auth_header.startswith("Bearer "):
-        return None
-    token = auth_header[len("Bearer "):].strip()
-    return token if token else None
+    parts = auth_header.strip().split(None, 1)
+    if len(parts) == 2 and parts[0].lower() == "bearer":
+        return parts[1].strip() or None
+    return None
 
 
 # ==============================================================================
@@ -35,16 +35,23 @@ async def register():
       Campos: password_hash, email
       Sin TTL (persistente en disco mediante directiva AOF).
     """
-    data = await request.get_json()
-    if not data:
-        return jsonify({"error": "Payload JSON requerido"}), 400
+    data = await request.get_json(silent=True)
+    if not data or not isinstance(data, dict):
+        return jsonify({"error": "Payload JSON requerido o malformado"}), 400
 
     username = data.get("username")
     password = data.get("password")
     email = data.get("email")
 
-    if not username or not password or not email:
-        return jsonify({"error": "Faltan campos obligatorios: username, password, email"}), 400
+    if (
+        not username or not isinstance(username, str) or not username.strip() or
+        not password or not isinstance(password, str) or not password.strip() or
+        not email or not isinstance(email, str) or not email.strip()
+    ):
+        return jsonify({"error": "Faltan campos obligatorios o vacíos: username, password, email"}), 400
+
+    username = username.strip()
+    email = email.strip()
 
     redis = await get_redis()
 
@@ -78,16 +85,20 @@ async def login():
       Valor: username
       TTL: 5 minutos (300 segundos).
     """
-    data = await request.get_json()
-    if not data:
-        return jsonify({"error": "Payload JSON requerido"}), 400
+    data = await request.get_json(silent=True)
+    if not data or not isinstance(data, dict):
+        return jsonify({"error": "Payload JSON requerido o malformado"}), 400
 
     username = data.get("username")
     password = data.get("password")
 
-    if not username or not password:
+    if (
+        not username or not isinstance(username, str) or not username.strip() or
+        not password or not isinstance(password, str) or not password.strip()
+    ):
         return jsonify({"error": "Credenciales incompletas: se requieren username y password"}), 400
 
+    username = username.strip()
     redis = await get_redis()
 
     # 1. Verificar si existe user:{username} y validar contraseña
@@ -144,7 +155,7 @@ async def logout():
     """
     POST /auth/logout
     Cierra la sesión del usuario e invalida el token actual.
-    Elimina 'session:{token}' en Redis de inmediato.
+    Elimina 'session:{token}' en Redis de inmediato de forma atómica.
     Respuesta:
       - 200 si la operación es exitosa.
       - 401 si falta cabecera, token desconocido/caducado o ya cerrado.
@@ -155,13 +166,10 @@ async def logout():
 
     redis = await get_redis()
 
-    # 1. Comprobar si la sesión existe
     session_key = f"session:{token}"
-    exists = await redis.exists(session_key)
-    if not exists:
+    # Eliminación atómica: delete() retorna 1 si la clave existía y fue borrada, 0 si no existía
+    deleted = await redis.delete(session_key)
+    if not deleted:
         return jsonify({"error": "Sesión desconocida, expirada o previamente cerrada"}), 401
-
-    # 2. Eliminar la sesión inmediatamente de Redis
-    await redis.delete(session_key)
 
     return jsonify({"message": "Sesión cerrada e invalidada exitosamente"}), 200

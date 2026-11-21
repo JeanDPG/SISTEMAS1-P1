@@ -1,3 +1,4 @@
-quart==0.19.4
+quart>=0.19.9
+flask<3.1.0
 redis==5.0.3
 hypercorn==0.16.0
